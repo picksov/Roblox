@@ -1514,6 +1514,11 @@ autoBuyDefensesDropdownUI = BuyTab:CreateDropdown({
 -- ──────────────────────────────────────────────────────────
 MiscTab:CreateSection("Overlook Enemy Base")
 
+-- Forward declarations for camera tracking (defined after UI setup)
+local cameraRenderSteppedConn = nil
+local startCameraTracking = function() end
+local stopCameraTracking = function() end
+
 cameraTrackingToggleUI = MiscTab:CreateToggle({
     Name = "📷 Overlook Enemy Base",
     CurrentValue = false,
@@ -3590,8 +3595,8 @@ end)
 -- Initialize state
 if cameraTargetPos then targetPos = cameraTargetPos end
 
-local cameraRenderSteppedConn = nil
-local function startCameraTracking()
+cameraRenderSteppedConn = nil
+startCameraTracking = function()
     if cameraRenderSteppedConn then return end
     cameraRenderSteppedConn = game:GetService("RunService").RenderStepped:Connect(function(dt)
     local camera = workspace.CurrentCamera
@@ -3718,7 +3723,7 @@ local function startCameraTracking()
     end
 end)
 end
-local function stopCameraTracking()
+stopCameraTracking = function()
     if cameraRenderSteppedConn then
         cameraRenderSteppedConn:Disconnect()
         cameraRenderSteppedConn = nil
