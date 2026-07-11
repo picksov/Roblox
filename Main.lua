@@ -184,24 +184,10 @@ local LocalPlayer = Players.LocalPlayer
 
 -- ════════════════════════════════════════════════════════════════════
 -- PandaAuth V3 Key Validation Gate & Real-time Check
--- Uses Pelinda library (same as loader) so dev keys / HWID-bypass keys work correctly
+-- Loader already validated the key. Main script:
+--   • Reads orbital.txt and validates contents via PandaAuth API
+--   • Background loop re-validates every 5 min for dashboard bans
 -- ════════════════════════════════════════════════════════════════════
-
--- Load Pelinda (same library the loader uses — handles all key types including dev/HWID-bypass)
-local _Pelinda = nil
-pcall(function()
-    local src = game:HttpGet("https://api.pandauth.com/lib/external/panda-v3-external.lua")
-    local fn = loadstring(src)
-    if fn then
-        local ok, lib = pcall(fn)
-        if ok then _Pelinda = lib end
-    end
-end)
-
-if not _Pelinda then
-    LocalPlayer:Kick("Validation failed: Could not load auth library. Please try again.")
-    return
-end
 
 local function readSavedKey()
     local ok, key = pcall(readfile, "orbital.txt")
@@ -209,36 +195,61 @@ local function readSavedKey()
     return key:gsub("%s+", "")
 end
 
--- Initial validation (strict — kicks on any failure)
-local function validateKey()
-    local key = readSavedKey()
-    if not key then
-        LocalPlayer:Kick("Validation failed: No key file found. Please run the loader first.")
-        return false
+local function getHWID()
+    local hwid = ""
+    pcall(function() hwid = gethwid() end)
+    if hwid == "" then
+        pcall(function() hwid = game:GetService("RbxAnalyticsService"):GetClientId() end)
     end
-
-    -- Pelinda.Init handles dev keys, HWID-bypass keys, blacklists, etc.
-    -- Username & UserId are logged via the Note field so you can spot game staff on your dashboard
-    local note = LocalPlayer.Name .. " (" .. tostring(LocalPlayer.UserId) .. ")"
-    local ok, result = pcall(_Pelinda.Init, {
-        Service    = "orbital",
-        Key        = key,
-        SilentMode = false,
-        Note       = note,
-    })
-
-    if not ok or result ~= "validated!!" then
-        LocalPlayer:Kick("Validation failed: " .. tostring(result or "Invalid or blacklisted key."))
-        return false
-    end
-
-    return true
+    return hwid
 end
 
-if not validateKey() then return end
+-- Validate key via raw PandaAuth API (key+hwid only — no extra params)
+-- Returns: true = valid, false = explicitly invalid, nil = network error (skip)
+local function checkKeyRaw(key)
+    local hwid = getHWID()
+    local url = "https://api.pandauth.com/v1/public/validate?service=orbital&key=" .. key .. "&hwid=" .. hwid
+    local ok, response = pcall(game.HttpGet, game, url)
+    if not ok or not response then return nil end -- network error, skip
+    local decoded
+    pcall(function() decoded = HttpService:JSONDecode(response) end)
+    if not decoded then return nil end -- parse error, skip
+    return decoded.success == true
+end
 
--- Background re-check (lenient — only kicks on explicit API rejection, ignores network errors)
+-- Gate: check file exists AND key is actually valid
+local _gateKey = readSavedKey()
+if not _gateKey then
+    LocalPlayer:Kick("Validation failed: No key file found. Please run the loader first.")
+    return
+end
+
+-- Validate the key contents (catches tampered/random orbital.txt)
+-- Only kick on explicit rejection — network errors let through (Roblox handles disconnects)
+local _gateResult = checkKeyRaw(_gateKey)
+if _gateResult == false then
+    LocalPlayer:Kick("Validation failed: Key is invalid or blacklisted.")
+    return
+end
+
+-- Background re-check via Pelinda (lenient — skips on library/network failure, only kicks on explicit rejection)
 task.spawn(function()
+    -- Give the loader's Pelinda instance a moment to settle, then load our own quietly
+    task.wait(10)
+
+    local _Pelinda = nil
+    pcall(function()
+        local src = game:HttpGet("https://api.pandauth.com/lib/external/panda-v3-external.lua")
+        local fn = loadstring(src)
+        if fn then
+            local ok2, lib = pcall(fn)
+            if ok2 then _Pelinda = lib end
+        end
+    end)
+
+    -- If Pelinda failed to load (e.g. no HTTP), just skip rechecks silently
+    if not _Pelinda then return end
+
     while task.wait(300) do -- 5 minutes
         local key = readSavedKey()
         if not key then break end
@@ -249,7 +260,7 @@ task.spawn(function()
             SilentMode = true,
         })
 
-        -- Only kick on explicit rejection (not network hiccups)
+        -- Only kick on explicit rejection, not on network/library errors
         if ok and result ~= "validated!!" then
             LocalPlayer:Kick("Your key was blacklisted or invalidated from the dashboard.")
             break
