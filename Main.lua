@@ -17,6 +17,10 @@ local _stringchar = string.char
 local _stringbyte = string.byte
 local _tableconcat = table.concat
 
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() or Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
 local function _ds(t) local r = {} for i = 1, #t do r[i] = _stringchar(t[i]) end return _tableconcat(r) end
 
 -- Encoded PandaAuth API base: https://api.pandauth.com/v1/public/validate
@@ -40,32 +44,19 @@ local _sigFn = _getgenv().__OSH_SIG
 local _secret = _getgenv().__OSH_SECRET
 
 local function _validateSession()
-    if not _session then warn("[OSH Debug] No session table found in getgenv()") return false end
-    if type(_session) ~= "table" then warn("[OSH Debug] Session is not a table") return false end
-    if not _session.k or not _session.h or not _session.t or not _session.s then 
-        warn("[OSH Debug] Session members missing: k="..tostring(_session.k)..", h="..tostring(_session.h)..", t="..tostring(_session.t)..", s="..tostring(_session.s)) 
-        return false 
-    end
-    if not _sigFn or type(_sigFn) ~= "function" then warn("[OSH Debug] Signature function missing or invalid in getgenv()") return false end
+    if not _session or type(_session) ~= "table" then return false end
+    if not _session.k or not _session.h or not _session.t or not _session.s then return false end
+    if not _sigFn or type(_sigFn) ~= "function" then return false end
     
     local diff = _ostime() - _session.t
-    if diff > 300 or diff < -300 then 
-        warn("[OSH Debug] Session token time delta is invalid: " .. tostring(diff) .. " seconds (max allowed: 300s)") 
-        return false 
-    end
+    if diff > 300 or diff < -300 then return false end
     
     local expectedSig = _sigFn(_session.k, _session.h, _session.t)
-    if expectedSig ~= _session.s then 
-        warn("[OSH Debug] Signature verification failed. Expected: " .. tostring(expectedSig) .. ", Got: " .. tostring(_session.s)) 
-        return false 
-    end
+    if expectedSig ~= _session.s then return false end
     
     local currentHwid
     _pcall(function() currentHwid = _gethwid() end)
-    if currentHwid and currentHwid ~= _session.h then 
-        warn("[OSH Debug] HWID mismatch. Current: " .. tostring(currentHwid) .. ", Token: " .. tostring(_session.h)) 
-        return false 
-    end
+    if currentHwid and currentHwid ~= _session.h then return false end
     return true
 end
 
