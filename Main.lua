@@ -184,70 +184,73 @@ local LocalPlayer = Players.LocalPlayer
 
 -- ════════════════════════════════════════════════════════════════════
 -- PandaAuth V3 Key Validation Gate & Real-time Check
+-- Uses Pelinda library (same as loader) so dev keys / HWID-bypass keys work correctly
 -- ════════════════════════════════════════════════════════════════════
-local function getHWID()
-    local hwid = ""
-    pcall(function() hwid = gethwid() end)
-    if hwid == "" then
-        pcall(function() hwid = game:GetService("RbxAnalyticsService"):GetClientId() end)
+
+-- Load Pelinda (same library the loader uses — handles all key types including dev/HWID-bypass)
+local _Pelinda = nil
+pcall(function()
+    local src = game:HttpGet("https://api.pandauth.com/lib/external/panda-v3-external.lua")
+    local fn = loadstring(src)
+    if fn then
+        local ok, lib = pcall(fn)
+        if ok then _Pelinda = lib end
     end
-    return hwid
+end)
+
+if not _Pelinda then
+    LocalPlayer:Kick("Validation failed: Could not load auth library. Please try again.")
+    return
 end
 
-local cachedHWID = getHWID()
-
-local function buildValidationURL(key)
-    local robloxUser = LocalPlayer.Name
-    local robloxId   = tostring(LocalPlayer.UserId)
-    return "https://api.pandauth.com/v1/public/validate?service=orbital"
-        .. "&key="    .. key
-        .. "&hwid="   .. cachedHWID
-        .. "&user="   .. robloxUser
-        .. "&userid=" .. robloxId
+local function readSavedKey()
+    local ok, key = pcall(readfile, "orbital.txt")
+    if not ok or not key or key == "" then return nil end
+    return key:gsub("%s+", "")
 end
 
--- Initial validation (strict — kicks on any failure including network errors)
+-- Initial validation (strict — kicks on any failure)
 local function validateKey()
-    local hasKey, key = pcall(readfile, "orbital.txt")
-    if not hasKey or not key or key == "" then
+    local key = readSavedKey()
+    if not key then
         LocalPlayer:Kick("Validation failed: No key file found. Please run the loader first.")
         return false
     end
-    key = key:gsub("%s+", "")
-    
-    local url = buildValidationURL(key)
-    local success, response = pcall(game.HttpGet, game, url)
-    if not success or not response then
-        LocalPlayer:Kick("Validation failed: Network error. Please try again.")
+
+    -- Pelinda.Init handles dev keys, HWID-bypass keys, blacklists, etc.
+    -- Username & UserId are logged via the Note field so you can spot game staff on your dashboard
+    local note = LocalPlayer.Name .. " (" .. tostring(LocalPlayer.UserId) .. ")"
+    local ok, result = pcall(_Pelinda.Init, {
+        Service    = "orbital",
+        Key        = key,
+        SilentMode = false,
+        Note       = note,
+    })
+
+    if not ok or result ~= "validated!!" then
+        LocalPlayer:Kick("Validation failed: " .. tostring(result or "Invalid or blacklisted key."))
         return false
     end
-    
-    local decoded
-    pcall(function() decoded = HttpService:JSONDecode(response) end)
-    if not decoded or not decoded.success then
-        LocalPlayer:Kick("Validation failed: " .. (decoded and decoded.message or "Invalid or blacklisted key."))
-        return false
-    end
-    
+
     return true
 end
 
 if not validateKey() then return end
 
--- Background re-check (lenient — only kicks on explicit API rejection, ignores network errors since Roblox handles disconnects natively)
+-- Background re-check (lenient — only kicks on explicit API rejection, ignores network errors)
 task.spawn(function()
     while task.wait(300) do -- 5 minutes
-        local hasKey, key = pcall(readfile, "orbital.txt")
-        if not hasKey or not key or key == "" then break end
-        key = key:gsub("%s+", "")
-        
-        local url = buildValidationURL(key)
-        local success, response = pcall(game.HttpGet, game, url)
-        if not success or not response then continue end -- network hiccup, skip
-        
-        local decoded
-        pcall(function() decoded = HttpService:JSONDecode(response) end)
-        if decoded and decoded.success == false then
+        local key = readSavedKey()
+        if not key then break end
+
+        local ok, result = pcall(_Pelinda.Init, {
+            Service    = "orbital",
+            Key        = key,
+            SilentMode = true,
+        })
+
+        -- Only kick on explicit rejection (not network hiccups)
+        if ok and result ~= "validated!!" then
             LocalPlayer:Kick("Your key was blacklisted or invalidated from the dashboard.")
             break
         end
