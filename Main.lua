@@ -1,105 +1,6 @@
--- ════════════════════════════════════════════════════════════════════
--- Orbital Strike — Self-Contained
--- Validates key independently before running.
--- ════════════════════════════════════════════════════════════════════
-
--- Step 1: Load Panda SDK
-local PANDA_SERVICE = "orbital"
-local PANDA_KEYFILE = "OrbitalStrikeKey.txt"
-
-local function loadPanda()
-    local ok, src = pcall(function() return game:HttpGet("https://api.pandauth.com/lib/external/panda-v3-external.lua") end)
-    if not ok or not src then return nil end
-    local fn = loadstring(src); if not fn then return nil end
-    local ok2, lib = pcall(fn); return ok2 and lib or nil
-end
-
-local Pelinda = loadPanda()
-if not Pelinda then
-    warn("[OrbitalStrike] Panda SDK unavailable — exiting")
-    return
-end
-
--- Step 2: Validate key
-local function validateKey(key)
-    key = (key or ""):gsub("%s+", "")
-    if #key < 5 then return false end
-    local ok, r = pcall(Pelinda.Init, { Service = PANDA_SERVICE, Key = key, SilentMode = true })
-    return ok and r == "validated!!"
-end
-
-local keyValid = false
-if isfile and isfile(PANDA_KEYFILE) then
-    local ok, data = pcall(readfile, PANDA_KEYFILE)
-    if ok and data then keyValid = validateKey(data) end
-end
-
-if not keyValid then
-    -- Fallback: try getgenv key from loader session
-    local sessionKey = getgenv().__OSH_LOADER_KEY
-    if sessionKey and validateKey(sessionKey) then
-        keyValid = true
-    end
-end
-
-if not keyValid then
-    warn("[OrbitalStrike] No valid key — exiting")
-    return
-end
-
-warn("[OrbitalStrike] Key validated. Starting...")
-
--- Self-integrity: periodic bypass verification
-task.spawn(function()
-    while true do
-        task.wait(300) -- every 5 minutes
-        local Query = {Constants = {" - On Xbox", " - On mobile", "_"}, IgnoreExecutor = true}
-        local d = filtergc("function", Query, true)
-        if d then
-            local u3 = debug.getupvalues(d)[3]
-            local ok = pcall(debug.getconstants, u3)
-            if ok then
-                -- Bypass was unhooked! Re-arm immediately
-                warn("[OrbitalStrike] Bypass compromised — re-arming")
-                local a, b, c, d2, e, f = debug.info(d, "slanf")
-                if getrenv and getrenv().debug and getrenv().debug.info then
-                    local origInfo = getrenv().debug.info
-                    local spoof = newcclosure(function(target, what, ...)
-                        if target == d then return a, b, c, d2, e, f end
-                        return origInfo(target, what, ...)
-                    end)
-                    pcall(hookfunction, origInfo, spoof)
-                end
-                if newcclosure then
-                    pcall(hookfunction, d, newcclosure(function() return task.wait(9e9) end))
-                end
-                -- Re-arm RemoteEvent disconnect
-                pcall(function()
-                    for _, child in ipairs(game:GetService("ReplicatedStorage"):GetChildren()) do
-                        if child:IsA("RemoteEvent") and child:FindFirstChild("__FUNCTION") then
-                            local conns = getconnections(child.OnClientEvent)
-                            for _, conn in ipairs(conns) do
-                                local ok2, consts = pcall(debug.getconstants, conn.Function)
-                                if ok2 and consts then
-                                    for _, c in ipairs(consts) do
-                                        if c == "Detected" then
-                                            for _, c2 in ipairs(conns) do
-                                                pcall(function() c2:Disconnect() end)
-                                            end
-                                            break
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end)
-            end
-        end
-    end
-end)
-
-
+-- Gate: Must be loaded through legitimate loader
+if not getgenv().__OSH_LOADER_KEY then return end
+warn("[OrbitalStrike] Loader verified. Starting...")
 
 setthreadidentity(8)
 
@@ -220,7 +121,6 @@ local function armBypass()
     return true
 end
 bypassArmed = armBypass()
-
 
 -- Task library fallback (for executors without native task library)
 if not task or not task.wait then
