@@ -14,6 +14,9 @@ if not newcclosure then newcclosure = function(f) return f end end
 if not math.clamp then math.clamp = function(x, lo, hi) if x < lo then return lo end if x > hi then return hi end return x end end
 
 -- ==================== Rayfield + Secure ID ====================
+getgenv().RAYFIELD_SECURE = true
+getgenv().RAYFIELD_ASSET_ID = 133114655245392
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 -- Rayfield loaded above
 
 -- ==================== Item Data Load ====================
@@ -117,11 +120,7 @@ local LocalPlayer = Players.LocalPlayer
 
 
 -- ──────────────────────────────────────────────────────────
-getgenv().RAYFIELD_SECURE = true
-getgenv().RAYFIELD_ASSET_ID = 133114655245392
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
-
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-- Rayfield pre-loaded from preamble
 local VolleyLaunchEvent = ReplicatedStorage:WaitForChild("Events"):WaitForChild("VolleyLaunch")
 local LaunchMissileEvent = ReplicatedStorage:WaitForChild("Events"):WaitForChild("LaunchMissile")
 -- MissileData pre-loaded from ItemsData.json (see above)
