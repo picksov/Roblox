@@ -156,22 +156,11 @@ getgenv().getrawmetatable = getrawmetatable or debug.getrawmetatable
 -- Task library fallback (for executors without native task library)
 if not task or not task.wait then
     local _wait = wait or function(t) return _G.wait(t or 1/60) end
-    local _spawn = spawn or function(fn)
-        local co = coroutine.create(function()
-            pcall(fn)
-        end)
-        coroutine.resume(co)
-    end
+    local _spawn = spawn or function(fn) coroutine.wrap(fn)() end
     getgenv().task = {
         wait = _wait,
         spawn = _spawn,
-        defer = _spawn,
-        delay = function(t, fn)
-            _spawn(function()
-                _wait(t)
-                pcall(fn)
-            end)
-        end,
+        delay = function(t, fn) _spawn(function() _wait(t) fn() end) end,
     }
 end
 
@@ -530,8 +519,6 @@ local missileAlertLast = 0
 local blackMarketShipActive = false
 local blackMarketTimerEnd = 0
 local hpOverlayLastUpdate = 0
-local efficientModeEnabled = false
-local balancedFireEnabled = false
 
 -- Session stats (transient)
 local sessionStats = {
@@ -654,6 +641,8 @@ local targetPriorityMode = Cfg.targetPriorityMode
 local targetPriorityList = Cfg.targetPriorityList
 local salvoSizeLimit = Cfg.salvoSizeLimit
 local selectedMissileTypes = Cfg.selectedMissileTypes
+local efficientModeEnabled = Cfg.efficientModeEnabled
+local balancedFireEnabled = Cfg.balancedFireEnabled
 local defenseModeEnabled = Cfg.defenseModeEnabled
 local defenseShieldTypes = Cfg.defenseShieldTypes
 local cameraYaw = Cfg.cameraYaw
@@ -1320,8 +1309,642 @@ end
 
 
 -- ──────────────────────────────────────────────────────────
--- Placement Engine — pending-placement cache, template helpers
+-- Rayfield Window Construction
 -- ──────────────────────────────────────────────────────────
+local Window = Rayfield:CreateWindow({
+    Name = "Orbital Strike Command",
+    LoadingTitle = "Orbital Strike Command",
+    LoadingSubtitle = "by picksov",
+    ConfigurationSaving = {
+        Enabled = false
+    },
+    Discord = {
+        Enabled = false
+    },
+    KeySystem = false
+})
+
+-- Tabs
+local MainTab = Window:CreateTab("⚔️ Main", 4483362458)
+local EconomyTab = Window:CreateTab("💰 Economy", 4483362458)
+local BuildingTab = Window:CreateTab("🏗️ Building", 4483362458)
+local MiscTab = Window:CreateTab("✨ Misc", 4483362458)
+local SettingsTab = Window:CreateTab("⚙️ Settings", 4483362458)
+
+-- ══════════════════════════════════════════════════════════
+-- MAIN TAB — PVP & Combat
+-- ══════════════════════════════════════════════════════════
+MainTab:CreateSection("Target Selector")
+
+local selectedPlayerLabel = MainTab:CreateLabel("Target Player: None")
+
+local playerList = {}
+local function refreshPlayerList()
+    local list = {}
+    if findCityRaidModel() then
+        table.insert(list, "City Raid")
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            table.insert(list, p.Name)
+        end
+    end
+    playerList = list
+    return list
+end
+
+refreshPlayerList()
+
+-- Dynamic background monitor to auto-refresh target player dropdown
+task.spawn(function()
+    local lastCRAState = nil
+    local lastPlayerCount = 0
+    while true do
+        task.wait(3.0)
+        local currentCRA = findCityRaidModel() ~= nil
+        local currentPC = #Players:GetPlayers()
+        if currentCRA ~= lastCRAState or currentPC ~= lastPlayerCount then
+            lastCRAState = currentCRA
+            lastPlayerCount = currentPC
+            pcall(function()
+                if playerDropdown and not isAutoFiring then
+                    -- Only refresh when not auto-firing (avoids overriding auto-cycle)
+                    playerDropdown:Refresh(refreshPlayerList())
+                end
+            end)
+        end
+    end
+end)
+
+local playerDropdown = MainTab:CreateDropdown({
+    Name = "Select Target Player",
+    Options = playerList,
+    CurrentOption = "",
+    MultipleOptions = false,
+    Callback = function(Option)
+        local opt = typeof(Option) == "table" and Option[1] or Option
+        activeTargetPlayer = opt
+        autoCycleShieldNotified = false
+        selectedPlayerLabel:Set("Target Player: " .. tostring(opt))
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "🔄 Refresh Player Dropdown",
+    Callback = function()
+        playerDropdown:Refresh(refreshPlayerList())
+    end,
+})
+
+MainTab:CreateSection("System Status")
+
+local statusParagraph = MainTab:CreateParagraph({
+    Title = "SYSTEM MONITOR",
+    Content = "Status: IDLE\nTarget Component: None\nTarget HP: - / -"
+})
+
+MainTab:CreateSection("Prioritization Mode")
+
+modeDropdownUI = MainTab:CreateDropdown({
+    Name = "Target Selection Mode",
+    Options = {
+        "Bases Mode (Priority Queue)",
+        "City Raid Mode (No Turrets)"
+    },
+    CurrentOption = "Bases Mode (Priority Queue)",
+    MultipleOptions = false,
+    Callback = function(Option)
+        local opt = Option[1] or Option
+        if opt == "Bases Mode (Priority Queue)" then
+            targetMode = "Bases"
+        elseif opt == "City Raid Mode (No Turrets)" then
+            targetMode = "CityRaid"
+        end
+    end,
+})
+
+MainTab:CreateSection("Target Priority & Cycling")
+MainTab:CreateToggle({
+    Name = "🔄 Auto-Cycle: Switch target when base is wiped",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoCycleEnabled = Value
+    end,
+})
+
+MainTab:CreateDropdown({
+    Name = "Target Priority Order",
+    Options = {"None", "Richest First", "Weakest First", "Custom Order"},
+    CurrentOption = "None",
+    MultipleOptions = false,
+    Callback = function(Option)
+        local opt = Option[1] or Option
+        targetPriorityMode = opt
+    end,
+})
+
+MainTab:CreateInput({
+    Name = "Custom Priority (comma-separated names)",
+    PlaceholderText = "Player1, Player2, Player3",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local list = {}
+        for name in string.gmatch(Text, "([^,]+)") do
+            local clean = name:gsub("^%s*(.-)%s*$", "%1")
+            if clean ~= "" then table.insert(list, clean) end
+        end
+        targetPriorityList = list
+    end,
+})
+
+MainTab:CreateSection("Firing Commands")
+
+autoFireToggleUI = MainTab:CreateToggle({
+    Name = "⚡ Enable Auto-Fire",
+    CurrentValue = false,
+    Callback = function(Value)
+        isAutoFiring = Value
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "🎯 Efficient Mode — Smart salvo sizing",
+    CurrentValue = false,
+    Callback = function(Value)
+        efficientModeEnabled = Value
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "⚖️ Balanced Fire — Interleave missile types",
+    CurrentValue = false,
+    Callback = function(Value)
+        balancedFireEnabled = Value
+    end,
+})
+
+salvoSizeInputUI = MainTab:CreateInput({
+    Name = "Missiles per Burst (Max 250)",
+    PlaceholderText = "250",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local val = tonumber(Text)
+        if val and val > 0 then
+            salvoSizeLimit = math.clamp(val, 1, 250)
+        else
+            salvoSizeLimit = 250
+        end
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "🔥 BURST FIRE",
+    Callback = function()
+        if not activeTargetPlayer then
+            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
+            return
+        end
+        local ready = getReadyMissiles()
+        if #ready == 0 then
+            Rayfield:Notify({ Title = "Error", Content = "No launchers ready!", Duration = 2.5 })
+            return
+        end
+        if burstRemaining > 0 then
+            Rayfield:Notify({ Title = "Busy", Content = "Burst already in progress (" .. burstRemaining .. " left). Use Emergency Stop to cancel.", Duration = 3 })
+            return
+        end
+        burstRemaining = salvoSizeLimit
+        Rayfield:Notify({
+            Title = "Burst Fire",
+            Content = "Firing " .. salvoSizeLimit .. " missiles at " .. activeTargetPlayer .. "...",
+            Duration = 3
+        })
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "🚨 EMERGENCY STOP",
+    Callback = function()
+        isAutoFiring = false
+        cancelBurst()
+        if autoFireToggleUI then pcall(function() autoFireToggleUI:Set(false) end) end
+        Rayfield:Notify({ Title = "Stopped", Content = "Emergency stop triggered! Firing disabled.", Duration = 3 })
+    end,
+})
+
+MainTab:CreateSection("🔥 Blatant — Rapid Fire")
+
+MainTab:CreateParagraph({
+    Title = "Blatant Info",
+    Content = "Fires missiles at maximum speed with no restrictions. Blatantly obvious cheating. Use at your own risk."
+})
+
+MainTab:CreateToggle({
+    Name = "💥 Enable Blatant Auto-Fire",
+    CurrentValue = false,
+    Callback = function(Value)
+        blatantAutoEnabled = Value
+    end,
+})
+
+MainTab:CreateInput({
+    Name = "Missiles per Blatant Salvo (Max 250)",
+    PlaceholderText = "250",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local val = tonumber(Text)
+        if val and val > 0 then blatantSalvoSize = math.clamp(val, 1, 250) end
+    end,
+})
+
+MainTab:CreateInput({
+    Name = "Blatant Cooldown (seconds, 0 = none)",
+    PlaceholderText = "0.5",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local val = tonumber(Text)
+        if val and val >= 0 then blatantCooldown = val end
+    end,
+})
+
+MainTab:CreateInput({
+    Name = "Custom Fire Count (for ⚡ FIRE button)",
+    PlaceholderText = "50",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local val = tonumber(Text)
+        if val and val > 0 then customFireCount = math.clamp(val, 1, 250) end
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "⚡ FIRE (Custom Count)",
+    Callback = function()
+        if not activeTargetPlayer then
+            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
+            return
+        end
+        local ready = getReadyMissiles()
+        if #ready == 0 then
+            Rayfield:Notify({ Title = "Error", Content = "No launchers ready!", Duration = 2.5 })
+            return
+        end
+        local toFire = math.min(customFireCount, #ready)
+        local objects = getActiveTargetObjects(activeTargetPlayer)
+        if #objects == 0 then
+            Rayfield:Notify({ Title = "No Fire", Content = "No targets found.", Duration = 2.5 })
+            return
+        end
+        local fired = 0
+        for i = 1, toFire do
+            local mInfo = ready[i]
+            local target = objects[(fired % #objects) + 1]
+            firedCache[mInfo.instance] = true
+            task.delay(3.5, function() firedCache[mInfo.instance] = nil end)
+            if target.instance then
+                local dmg = missileDamage[mInfo.name] or 500
+                dispatchedDamage[target.instance] = (dispatchedDamage[target.instance] or 0) + dmg
+                task.delay(4.0, function()
+                    if dispatchedDamage[target.instance] then
+                        dispatchedDamage[target.instance] = dispatchedDamage[target.instance] - dmg
+                        if dispatchedDamage[target.instance] <= 0 then dispatchedDamage[target.instance] = nil end
+                    end
+                end)
+            end
+            pcall(function() LaunchMissileEvent:FireServer(mInfo.instance, target.instance:GetPivot().Position) end)
+            fired = fired + 1
+        end
+        sessionStats.missilesFired = sessionStats.missilesFired + fired
+        Rayfield:Notify({ Title = "Custom Fire", Content = "Fired " .. fired .. " missiles!", Duration = 3 })
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "🔥 FIRE ALL",
+    Callback = function()
+        if not activeTargetPlayer then
+            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
+            return
+        end
+        local fired = fireAllRapid(activeTargetPlayer)
+        if fired > 0 then
+            Rayfield:Notify({ Title = "Blatant Fire", Content = "Fired " .. fired .. " missiles at once!", Duration = 3 })
+        else
+            Rayfield:Notify({ Title = "No Fire", Content = "No ready launchers or targets found.", Duration = 2.5 })
+        end
+    end,
+})
+
+
+-- Main Tab — Priority Sorting
+MainTab:CreateSection("Bases Priority Settings")
+
+MainTab:CreateParagraph({
+    Title = "About Prioritization List",
+    Content = "This priority list is ONLY used when 'Target Selection Mode' is set to 'Bases Mode (Priority Queue)'.\n\nIt searches and locks onto base components in the order specified below. Separate entries with commas."
+})
+
+priorityInputUI = MainTab:CreateInput({
+    Name = "Edit Priority Queue",
+    PlaceholderText = "PlacedTurrets, PlacedBuildings, PlacedShields",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        updatePriorityList(Text)
+    end,
+})
+
+-- Main Tab — Weapon Checklist & Fire Modes
+MainTab:CreateSection("Weapon Checklist")
+
+local sortedMissiles = {}
+for name, data in pairs(MissileData) do
+    if not cannonSet[name] then
+        table.insert(sortedMissiles, name)
+    end
+end
+table.sort(sortedMissiles)
+
+-- Default all select in selectedMissileTypes
+for _, name in ipairs(sortedMissiles) do
+    selectedMissileTypes[name] = true
+end
+
+weaponDropdownUI = MainTab:CreateDropdown({
+    Name = "Select Launcher Types to Fire",
+    Options = sortedMissiles,
+    CurrentOption = sortedMissiles, -- Select all by default
+    MultipleOptions = true,
+    Flag = "weaponChecklist",
+    Callback = function(Options)
+        if not Options then return end
+        local newSelected = {}
+        for k, v in pairs(Options) do
+            if type(k) == "number" and type(v) == "string" then
+                newSelected[v] = true
+            elseif type(k) == "string" and v == true then
+                newSelected[k] = true
+            end
+        end
+        selectedMissileTypes = newSelected
+    end,
+})
+
+-- ══════════════════════════════════════════════════════════
+-- ECONOMY TAB — Auto Buy & Spins
+-- ══════════════════════════════════════════════════════════
+EconomyTab:CreateSection("Auto-Buy Activation")
+
+autoBuyToggleUI = EconomyTab:CreateToggle({
+    Name = "💰 Enable Auto-Buy",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoBuyEnabled = Value
+    end,
+})
+
+EconomyTab:CreateSection("Configure Auto-Buy Items")
+
+autoBuyMissilesDropdownUI = EconomyTab:CreateDropdown({
+    Name = "Auto-Buy Missiles",
+    Options = orderedMissiles,
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "autoBuyMissiles",
+    Callback = function(Options)
+        if not Options then return end
+        local newSelected = {}
+        for k, v in pairs(Options) do
+            if type(k) == "number" and type(v) == "string" then
+                newSelected[v] = true
+            elseif type(k) == "string" and v == true then
+                newSelected[k] = true
+            end
+        end
+        autoBuySelectedMissiles = newSelected
+    end,
+})
+
+autoBuyBuildingsDropdownUI = EconomyTab:CreateDropdown({
+    Name = "Auto-Buy Buildings",
+    Options = orderedBuildings,
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "autoBuyBuildings",
+    Callback = function(Options)
+        if not Options then return end
+        local newSelected = {}
+        for k, v in pairs(Options) do
+            if type(k) == "number" and type(v) == "string" then
+                newSelected[v] = true
+            elseif type(k) == "string" and v == true then
+                newSelected[k] = true
+            end
+        end
+        autoBuySelectedBuildings = newSelected
+    end,
+})
+
+autoBuyDefensesDropdownUI = EconomyTab:CreateDropdown({
+    Name = "Auto-Buy Defenses",
+    Options = orderedDefenses,
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "autoBuyDefenses",
+    Callback = function(Options)
+        if not Options then return end
+        local newSelected = {}
+        for k, v in pairs(Options) do
+            if type(k) == "number" and type(v) == "string" then
+                newSelected[v] = true
+            elseif type(k) == "string" and v == true then
+                newSelected[k] = true
+            end
+        end
+        autoBuySelectedDefenses = newSelected
+    end,
+})
+
+-- ══════════════════════════════════════════════════════════
+-- MISC TAB — Camera, Overlay & Alerts
+-- ══════════════════════════════════════════════════════════
+MiscTab:CreateSection("Overlook Enemy Base")
+
+-- Forward declarations for camera tracking (defined after UI setup)
+local cameraRenderSteppedConn = nil
+local startCameraTracking = function() end
+local stopCameraTracking = function() end
+
+local targetYaw, targetPitch, targetDist = 45, 40, 120
+local targetPos = Vector3.zero
+
+cameraTrackingToggleUI = MiscTab:CreateToggle({
+    Name = "📷 Overlook Enemy Base",
+    CurrentValue = false,
+    Callback = function(Value)
+        trackingEnabled = Value
+        if Value then
+            startCameraTracking()
+            local camera = workspace.CurrentCamera
+            if camera then
+                camera.CameraType = Enum.CameraType.Scriptable
+                -- Determine target position (enemy base or current look-at)
+                local lookTarget
+                if activeTargetPlayer then
+                    local eb = getBaseByPlayerName(activeTargetPlayer)
+                    if eb then
+                        lookTarget = eb:GetPivot().Position
+                        local myPos = getMyBase() and getMyBase():GetPivot().Position or camera.CFrame.Position
+                        local dir = (lookTarget - myPos).Unit
+                        targetYaw = math.deg(math.atan2(dir.X, dir.Z))
+                        targetPitch = 35
+                    end
+                end
+                if not lookTarget then
+                    lookTarget = camera.CFrame.Position + camera.CFrame.LookVector * 80
+                    targetYaw, targetPitch = 45, 35
+                end
+                cameraTargetPos = lookTarget
+                targetPos = lookTarget
+                targetDist = 120
+
+                -- Start from current camera position for smooth transition
+                local currentOffset = camera.CFrame.Position - lookTarget
+                cameraDistance = math.clamp(currentOffset.Magnitude, 40, 350)
+                cameraYaw = math.deg(math.atan2(currentOffset.X, currentOffset.Z))
+                cameraPitch = math.deg(math.asin(math.clamp(currentOffset.Y / cameraDistance, -1, 1)))
+                activeTrackingEnd = 9e9
+            end
+        else
+            stopCameraTracking()
+            pcall(function()
+                local camera = workspace.CurrentCamera
+                if camera and camera.CameraType == Enum.CameraType.Scriptable then
+                    camera.CameraType = Enum.CameraType.Custom
+                    local char = LocalPlayer.Character
+                    local hum = char and char:FindFirstChildOfClass("Humanoid")
+                    if hum then camera.CameraSubject = hum end
+                end
+            end)
+            activeTrackingEnd = 0
+        end
+    end,
+})
+
+
+
+local hpBars = {} -- [building] = BillboardGui
+
+MiscTab:CreateToggle({
+    Name = "💚 Enemy HP Bars (Free Cam Overlay)",
+    CurrentValue = false,
+    Callback = function(Value)
+        hpOverlayEnabled = Value
+        if not Value then
+            for _, bg in pairs(hpBars) do pcall(function() bg:Destroy() end) end
+            hpBars = {}
+        end
+    end,
+})
+
+-- Misc Tab — Defense
+
+MiscTab:CreateSection("Defense Mode")
+MiscTab:CreateToggle({
+    Name = "🛡️ Defense Mode — Detect incoming attacks",
+    CurrentValue = false,
+    Callback = function(Value)
+        defenseModeEnabled = Value
+        if not Value then underAttackUntil = 0 end
+    end,
+})
+MiscTab:CreateDropdown({
+    Name = "Shields to Use for Defense",
+    Options = {"Small Shield", "Good Shield", "Big Shield", "Hellstone Shield"},
+    CurrentOption = {"Small Shield", "Good Shield", "Big Shield", "Hellstone Shield"},
+    MultipleOptions = true,
+    Callback = function(Options)
+        local sel = {}
+        for _, name in ipairs(Options) do sel[name] = true end
+        defenseShieldTypes = sel
+    end,
+})
+
+MiscTab:CreateSection("Auto-Repair")
+
+autoRepairToggleUI = MiscTab:CreateToggle({
+    Name = "🔧 Enable Auto-Repair",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoRepairEnabled = Value
+    end,
+})
+
+EconomyTab:CreateSection("Black Market Actions")
+
+autoSpinBlackMarketToggleUI = EconomyTab:CreateToggle({
+    Name = "🎰 Auto-Spin Black Market (Gems)",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoSpinBlackMarket = Value
+    end,
+})
+EconomyTab:CreateToggle({
+    Name = "🍀 Auto-Spin Lucky Spins",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoSpinLucky = Value
+    end,
+})
+
+MiscTab:CreateSection("Rewards & Quests Auto-Claim")
+
+autoClaimRewardsToggleUI = MiscTab:CreateToggle({
+    Name = "🎁 Auto-Claim Quests & Rewards",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoClaimRewards = Value
+    end,
+})
+
+MiscTab:CreateToggle({
+    Name = "🏰 Auto-Claim Clan Mission Rewards",
+    CurrentValue = false,
+    Callback = function(Value)
+        autoClanClaimEnabled = Value
+    end,
+})
+
+MiscTab:CreateSection("Session Stats")
+
+local statsParagraph = MiscTab:CreateParagraph({
+    Title = "SESSION STATS",
+    Content = "Missiles Fired: 0\nDamage Dealt: 0\nBuildings Destroyed: 0\nBases Wiped: 0\nELO Gained: 0"
+})
+
+MiscTab:CreateSection("Missile Threshold Alert")
+
+MiscTab:CreateToggle({
+    Name = "⚠️ Alert when Missile Count Drops Below Threshold",
+    CurrentValue = false,
+    Callback = function(Value)
+        missileAlertEnabled = Value
+    end,
+})
+
+MiscTab:CreateInput({
+    Name = "Missile Alert Threshold",
+    PlaceholderText = "10",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local val = tonumber(Text)
+        if val and val > 0 then missileAlertThreshold = val end
+    end,
+})
+
+-- ──────────────────────────────────────────────────────────
+-- Template System: Save & Load Base Layout
+-- ──────────────────────────────────────────────────────────
+local canPlaceAt -- Forward declaration
 
 -- Local pending-placement cache: tracks positions we've just fired at so canPlaceAt
 -- can see them before the server syncs back. Entries expire after PENDING_TTL seconds.
@@ -1397,916 +2020,18 @@ local function getTemplateList()
     return list
 end
 
+-- ══════════════════════════════════════════════════════════
+-- BUILDING TAB — Templates & Auto-Build
+-- ══════════════════════════════════════════════════════════
 
--- ──────────────────────────────────────────────────────────
--- Placement Engine — weapon geometry & collision detection
--- ──────────────────────────────────────────────────────────
+BuildingTab:CreateSection("📐 Base Template System")
 
--- Precompute Weapon Geometry
-local weaponGeometry = {}
-local weaponGeometryLoaded = false
-pcall(function()
-    local raw = game:HttpGet("https://raw.githubusercontent.com/picksov/Roblox/refs/heads/main/weapon-geometry.json")
-    local data = game:GetService("HttpService"):JSONDecode(raw)
-    if data then
-        for name, geom in pairs(data) do
-            weaponGeometry[name] = {
-                u45 = geom.u45, stepX = geom.stepX, stepZ = geom.stepZ,
-                size = Vector3.new(geom.sizeX, geom.sizeY, geom.sizeZ)
-            }
-        end
-        weaponGeometryLoaded = true
-    end
-end)
-local function precomputeWeaponGeometry()
-    for name, data in pairs(MissileData) do
-        if type(data) == "table" then
-            local folder = ReplicatedStorage.Assets:FindFirstChild("Missiles")
-            local m = folder and folder:FindFirstChild(name)
-            if not m and ReplicatedStorage.Assets:FindFirstChild("Cannons") then
-                m = ReplicatedStorage.Assets.Cannons:FindFirstChild(name)
-            end
-            if m then
-                local clone = m:Clone()
-                local u42 = data.IsCannon and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
-                clone:PivotTo(clone:GetPivot() * u42)
-                local Y = clone:GetPivot().Y
-                local bboxCF, bboxSize = clone:GetBoundingBox()
-                local u45 = Y - (bboxCF.Y - bboxSize.Y / 2)
-                local stepX = bboxSize.Y + 0.2; local stepZ = bboxSize.Z + 0.2
-                weaponGeometry[name] = { u45 = u45, stepX = stepX, stepZ = stepZ, size = bboxSize }
-                clone:Destroy()
-            else
-                weaponGeometry[name] = { u45 = 2, stepX = 3.2, stepZ = 3.2, size = Vector3.new(4, 8, 4) }
-            end
-        end
-    end
-end
-if not weaponGeometryLoaded then precomputeWeaponGeometry() end
-
-local function canPlaceAt(cf, size, base)
-    cleanPendingCache()
-    if isPendingBlocked(cf, size) then return false end
-    local pos = cf.Position
-    local halfWorldX = size.Y / 2 + 1.0; local halfWorldZ = size.Z / 2 + 1.0
-    local folders = {"PlacedMissiles", "PlacedBuildings", "PlacedTurrets", "PlacedShields"}
-    for _, folderName in ipairs(folders) do
-        local folder = base:FindFirstChild(folderName)
-        if folder then
-            for _, item in ipairs(folder:GetChildren()) do
-                local itemPos = item:IsA("Model") and item:GetPivot().Position or (item:IsA("BasePart") and item.Position)
-                if itemPos then
-                    if math.abs(pos.X - itemPos.X) < halfWorldX and math.abs(pos.Z - itemPos.Z) < halfWorldZ then return false end
-                end
-            end
-        end
-    end
-    return true
-end
-
-local function firePlaceMissile(name, worldCF)
-    recordPending(worldCF)
-    pcall(function() ReplicatedStorage.Events.PlaceMissile:FireServer(name, worldCF) end)
-end
-
--- Fast auto-build helpers
-local function buildPlacedLookup(base)
-    local lookup = {}
-    local folders = {"PlacedMissiles", "PlacedBuildings", "PlacedTurrets", "PlacedShields"}
-    for _, fn in ipairs(folders) do
-        local f = base:FindFirstChild(fn)
-        if f then
-            for _, item in ipairs(f:GetChildren()) do
-                local pos = item:IsA("Model") and item:GetPivot().Position or (item:IsA("BasePart") and item.Position)
-                if pos then lookup[roundKey(pos.X) .. "," .. roundKey(pos.Z)] = true end
-            end
-        end
-    end
-    return lookup
-end
-
-local function canPlaceAtFast(cf, size, placedLookup)
-    if not size then return true end
-    local pos = cf.Position; local now = os.clock()
-    local halfX = size.Y / 2 + 1.0; local halfZ = size.Z / 2 + 1.0
-    local ckey = roundKey(pos.X) .. "," .. roundKey(pos.Z)
-    if placedLookup[ckey] then return false end
-    local ts = pendingPlacements[ckey]
-    if ts and now - ts < PENDING_TTL then return false end
-    for dx = -halfX, halfX, 1.0 do
-        for dz = -halfZ, halfZ, 1.0 do
-            local key = roundKey(pos.X + dx) .. "," .. roundKey(pos.Z + dz)
-            if placedLookup[key] then return false end
-            local ts2 = pendingPlacements[key]
-            if ts2 and now - ts2 < PENDING_TTL then return false end
-        end
-    end
-    return true
-end
-
--- Auto-Build
-local function runAutoBuild()
-    if isBuilding then return 0 end
-    isBuilding = true; local placedCount = 0
-    local success, err = pcall(function()
-        local base = getMyBase(); if not base then return end
-        local zone = base:FindFirstChild("PlacementZone"); if not zone then return end
-        local zoneCF = zone.CFrame; local zoneSize = zone.Size
-        local halfX = math.floor(zoneSize.X / 2); local halfZ = math.floor(zoneSize.Z / 2)
-        local placedFolder = base:FindFirstChild("PlacedMissiles")
-        local cachedPlaced = placedFolder and #placedFolder:GetChildren() or 0
-        local placesSinceRefresh = 0
-        local function refreshPlaced()
-            cachedPlaced = placedFolder and #placedFolder:GetChildren() or cachedPlaced; placesSinceRefresh = 0
-        end
-        local function bumpPlaced()
-            cachedPlaced = cachedPlaced + 1; placesSinceRefresh = placesSinceRefresh + 1
-            if placesSinceRefresh >= 20 then refreshPlaced() end
-        end
-        local toolCounts = {}; local orderedToBuild = {}
-        for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
-            if child:IsA("Tool") and autoBuildSelectedMissileTypes[child.Name] then
-                toolCounts[child.Name] = (toolCounts[child.Name] or 0) + 1
-            end
-        end
-        if LocalPlayer.Character then
-            for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
-                if child:IsA("Tool") and autoBuildSelectedMissileTypes[child.Name] then
-                    toolCounts[child.Name] = (toolCounts[child.Name] or 0) + 1
-                end
-            end
-        end
-        for name, count in pairs(toolCounts) do
-            table.insert(orderedToBuild, {name = name, count = count, price = MissileData[name] and MissileData[name].Price or 0})
-        end
-        table.sort(orderedToBuild, function(a, b) return a.price < b.price end)
-        cleanPendingCache(); local placedLookup = buildPlacedLookup(base)
-        local fires = 0; local scanMargin = 4
-        for _, info in ipairs(orderedToBuild) do
-            if not autoBuildMissilesToggleEnabled then break end
-            local name = info.name
-            local geom = weaponGeometry[name] or { u45 = 2, stepX = 3.2, stepZ = 3.2, size = Vector3.new(4, 8, 4) }
-            local upRotation = cannonSet[name] and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
-            local invRemaining = info.count
-            for x = -halfX + scanMargin, halfX - scanMargin, geom.stepX do
-                if not autoBuildMissilesToggleEnabled or invRemaining <= 0 then break end
-                if placedFolder and #placedFolder:GetChildren() >= 250 then break end
-                for z = -halfZ + scanMargin, halfZ - scanMargin, geom.stepZ do
-                    if not autoBuildMissilesToggleEnabled or invRemaining <= 0 then break end
-                    if placedFolder and #placedFolder:GetChildren() >= 250 then break end
-                    local worldCF = zoneCF:ToWorldSpace(CFrame.new(x, geom.u45, z) * upRotation)
-                    if precisionBuildEnabled then
-                        if canPlaceAt(worldCF, geom.size, base) then
-                            local before = cachedPlaced; firePlaceMissile(name, worldCF)
-                            task.wait(0.02); local now = placedFolder and #placedFolder:GetChildren() or before
-                            if now > before then placedCount = placedCount + 1; bumpPlaced() end
-                            invRemaining = invRemaining - 1
-                        end
-                    else
-                        if canPlaceAtFast(worldCF, geom.size, placedLookup) then
-                            firePlaceMissile(name, worldCF)
-                            placedLookup[roundKey(worldCF.Position.X) .. "," .. roundKey(worldCF.Position.Z)] = true
-                            fires = fires + 1; invRemaining = invRemaining - 1
-                            if placedFolder and #placedFolder:GetChildren() >= 250 then break end
-                            task.wait(0.12)
-                        end
-                    end
-                end
-            end
-        end
-        if not precisionBuildEnabled then
-            task.wait(0.2); placedCount = placedFolder and #placedFolder:GetChildren() or fires
-        end
-        -- Gap-fill (precision mode)
-        if precisionBuildEnabled then
-        refreshPlaced()
-        if autoBuildMissilesToggleEnabled and (placedFolder and #placedFolder:GetChildren() or 0) < 250 then
-            local remainingTools = {}
-            for _, info in ipairs(orderedToBuild) do
-                local n = 0
-                for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
-                    if child.Name == info.name then n = n + 1 end
-                end
-                if LocalPlayer.Character then
-                    for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
-                        if child.Name == info.name then n = n + 1 end
-                    end
-                end
-                if n > 0 then table.insert(remainingTools, {name = info.name, price = info.price, inv = n}) end
-            end
-            table.sort(remainingTools, function(a, b) return a.price < b.price end)
-            for _, rt in ipairs(remainingTools) do
-                if not autoBuildMissilesToggleEnabled or (placedFolder and #placedFolder:GetChildren() >= 250) then break end
-                local geom = weaponGeometry[rt.name] or { u45 = 2, size = Vector3.new(4, 8, 4) }
-                local upRotation = cannonSet[rt.name] and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
-                for x = -halfX, halfX, 1.8 do
-                    if not autoBuildMissilesToggleEnabled or (placedFolder and #placedFolder:GetChildren() >= 250) or rt.inv <= 0 then break end
-                    for z = -halfZ, halfZ, 1.8 do
-                        if not autoBuildMissilesToggleEnabled or (placedFolder and #placedFolder:GetChildren() >= 250) or rt.inv <= 0 then break end
-                        local worldCF = zoneCF:ToWorldSpace(CFrame.new(x, geom.u45, z) * upRotation)
-                        if canPlaceAtFast(worldCF, geom.size, placedLookup) then
-                            local before = placedFolder and #placedFolder:GetChildren() or 0; firePlaceMissile(rt.name, worldCF)
-                            placedLookup[roundKey(worldCF.Position.X) .. "," .. roundKey(worldCF.Position.Z)] = true
-                            local now = placedFolder and #placedFolder:GetChildren() or before
-                            if now > before then placedCount = placedCount + 1; bumpPlaced() end
-                            rt.inv = rt.inv - 1; task.wait(0.12)
-                        end
-                    end
-                end
-            end
-            -- Precision retry sweep
-            refreshPlaced()
-            if precisionBuildEnabled and cachedPlaced < 250 then
-                local retryTools = {}
-                for _, info in ipairs(orderedToBuild) do
-                    local n = 0
-                    for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
-                        if child.Name == info.name then n = n + 1 end
-                    end
-                    if LocalPlayer.Character then
-                        for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
-                            if child.Name == info.name then n = n + 1 end
-                        end
-                    end
-                    if n > 0 then table.insert(retryTools, {name = info.name, price = info.price}) end
-                end
-                table.sort(retryTools, function(a, b) return a.price < b.price end)
-                for _, rt in ipairs(retryTools) do
-                    if not autoBuildMissilesToggleEnabled or cachedPlaced >= 250 then break end
-                    local geom = weaponGeometry[rt.name] or { u45 = 2, size = Vector3.new(4, 8, 4) }
-                    local upRotation = cannonSet[rt.name] and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
-                    for x = -halfX, halfX, 1.0 do
-                        if not autoBuildMissilesToggleEnabled or cachedPlaced >= 250 then break end
-                        for z = -halfZ, halfZ, 1.0 do
-                            if not autoBuildMissilesToggleEnabled or cachedPlaced >= 250 then break end
-                            local worldCF = zoneCF:ToWorldSpace(CFrame.new(x, geom.u45, z) * upRotation)
-                            local before = placedFolder and #placedFolder:GetChildren() or 0; firePlaceMissile(rt.name, worldCF)
-                            task.wait(0.02); local now = placedFolder and #placedFolder:GetChildren() or before
-                            if now > before then placedCount = placedCount + 1; bumpPlaced() end
-                        end
-                    end
-                end
-            end
-        end
-        end
-    end)
-    isBuilding = false
-    if not success then warn("[Auto-Build Error]: " .. tostring(err)) end
-    return placedCount
-end
-
-
--- ──────────────────────────────────────────────────────────
--- Rayfield Window Construction
--- ──────────────────────────────────────────────────────────
-local Window = Rayfield:CreateWindow({
-    Name = "Orbital Strike Command",
-    LoadingTitle = "Orbital Strike Command",
-    LoadingSubtitle = "by picksov",
-    ConfigurationSaving = {
-        Enabled = false
-    },
-    Discord = {
-        Enabled = false
-    },
-    KeySystem = false
-})
-
--- Tabs
-local TargetTab = Window:CreateTab("💥 Target Controls", 4483362458)
-local PriorityTab = Window:CreateTab("📊 Priority Sorting", 4483362458)
-local WeaponTab = Window:CreateTab("💣 Weapon Checklist", 4483362458)
-local BuyTab = Window:CreateTab("💰 Auto Buy", 4483362458)
-local DefenseTab = Window:CreateTab("🛡️ Defense", 4483362458)
-local MiscTab = Window:CreateTab("✨ Miscellaneous", 4483362458)
-local SettingsTab = Window:CreateTab("⚙️ Settings", 4483362458)
-
--- ──────────────────────────────────────────────────────────
--- 1. Direct Target Controls Tab Elements
--- ──────────────────────────────────────────────────────────
-TargetTab:CreateSection("Target Selector")
-
-local selectedPlayerLabel = TargetTab:CreateLabel("Target Player: None")
-
-local playerList = {}
-local function refreshPlayerList()
-    local list = {}
-    if findCityRaidModel() then
-        table.insert(list, "City Raid")
-    end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then
-            table.insert(list, p.Name)
-        end
-    end
-    playerList = list
-    return list
-end
-
-refreshPlayerList()
-
--- Dynamic background monitor to auto-refresh target player dropdown
-task.spawn(function()
-    local lastCRAState = nil
-    local lastPlayerCount = 0
-    while true do
-        task.wait(3.0)
-        local currentCRA = findCityRaidModel() ~= nil
-        local currentPC = #Players:GetPlayers()
-        if currentCRA ~= lastCRAState or currentPC ~= lastPlayerCount then
-            lastCRAState = currentCRA
-            lastPlayerCount = currentPC
-            pcall(function()
-                if playerDropdown and not isAutoFiring then
-                    -- Only refresh when not auto-firing (avoids overriding auto-cycle)
-                    playerDropdown:Refresh(refreshPlayerList())
-                end
-            end)
-        end
-    end
-end)
-
-local playerDropdown = TargetTab:CreateDropdown({
-    Name = "Select Target Player",
-    Options = playerList,
-    CurrentOption = "",
-    MultipleOptions = false,
-    Callback = function(Option)
-        local opt = typeof(Option) == "table" and Option[1] or Option
-        activeTargetPlayer = opt
-        autoCycleShieldNotified = false
-        selectedPlayerLabel:Set("Target Player: " .. tostring(opt))
-    end,
-})
-
-TargetTab:CreateButton({
-    Name = "🔄 Refresh Player Dropdown",
-    Callback = function()
-        playerDropdown:Refresh(refreshPlayerList())
-    end,
-})
-
-TargetTab:CreateSection("System Status")
-
-local statusParagraph = TargetTab:CreateParagraph({
-    Title = "SYSTEM MONITOR",
-    Content = "Status: IDLE\nTarget Component: None\nTarget HP: - / -"
-})
-
-TargetTab:CreateSection("Prioritization Mode")
-
-modeDropdownUI = TargetTab:CreateDropdown({
-    Name = "Target Selection Mode",
-    Options = {
-        "Bases Mode (Priority Queue)",
-        "City Raid Mode (No Turrets)"
-    },
-    CurrentOption = "Bases Mode (Priority Queue)",
-    MultipleOptions = false,
-    Callback = function(Option)
-        local opt = Option[1] or Option
-        if opt == "Bases Mode (Priority Queue)" then
-            targetMode = "Bases"
-        elseif opt == "City Raid Mode (No Turrets)" then
-            targetMode = "CityRaid"
-        end
-    end,
-})
-
-TargetTab:CreateSection("Target Priority & Cycling")
-TargetTab:CreateToggle({
-    Name = "🔄 Auto-Cycle: Switch target when base is wiped",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoCycleEnabled = Value
-    end,
-})
-
-TargetTab:CreateDropdown({
-    Name = "Target Priority Order",
-    Options = {"None", "Richest First", "Weakest First", "Custom Order"},
-    CurrentOption = "None",
-    MultipleOptions = false,
-    Callback = function(Option)
-        local opt = Option[1] or Option
-        targetPriorityMode = opt
-    end,
-})
-
-TargetTab:CreateInput({
-    Name = "Custom Priority (comma-separated names)",
-    PlaceholderText = "Player1, Player2, Player3",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local list = {}
-        for name in string.gmatch(Text, "([^,]+)") do
-            local clean = name:gsub("^%s*(.-)%s*$", "%1")
-            if clean ~= "" then table.insert(list, clean) end
-        end
-        targetPriorityList = list
-    end,
-})
-
-TargetTab:CreateSection("Firing Commands")
-
-autoFireToggleUI = TargetTab:CreateToggle({
-    Name = "⚡ Enable Auto-Fire",
-    CurrentValue = false,
-    Callback = function(Value)
-        isAutoFiring = Value
-    end,
-})
-
-salvoSizeInputUI = TargetTab:CreateInput({
-    Name = "Missiles per Burst (Max 250)",
-    PlaceholderText = "250",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local val = tonumber(Text)
-        if val and val > 0 then
-            salvoSizeLimit = math.clamp(val, 1, 250)
-        else
-            salvoSizeLimit = 250
-        end
-    end,
-})
-
-TargetTab:CreateButton({
-    Name = "🔥 BURST FIRE",
-    Callback = function()
-        if not activeTargetPlayer then
-            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
-            return
-        end
-        local ready = getReadyMissiles()
-        if #ready == 0 then
-            Rayfield:Notify({ Title = "Error", Content = "No launchers ready!", Duration = 2.5 })
-            return
-        end
-        if burstRemaining > 0 then
-            Rayfield:Notify({ Title = "Busy", Content = "Burst already in progress (" .. burstRemaining .. " left). Use Emergency Stop to cancel.", Duration = 3 })
-            return
-        end
-        burstRemaining = salvoSizeLimit
-        Rayfield:Notify({
-            Title = "Burst Fire",
-            Content = "Firing " .. salvoSizeLimit .. " missiles at " .. activeTargetPlayer .. "...",
-            Duration = 3
-        })
-    end,
-})
-
-TargetTab:CreateButton({
-    Name = "🚨 EMERGENCY STOP",
-    Callback = function()
-        isAutoFiring = false
-        cancelBurst()
-        if autoFireToggleUI then pcall(function() autoFireToggleUI:Set(false) end) end
-        Rayfield:Notify({ Title = "Stopped", Content = "Emergency stop triggered! Firing disabled.", Duration = 3 })
-    end,
-})
-
-TargetTab:CreateSection("🔥 Blatant — Rapid Fire")
-
-TargetTab:CreateParagraph({
-    Title = "Blatant Info",
-    Content = "Fires missiles at maximum speed with no restrictions. Blatantly obvious cheating. Use at your own risk."
-})
-
-TargetTab:CreateToggle({
-    Name = "💥 Enable Blatant Auto-Fire",
-    CurrentValue = false,
-    Callback = function(Value)
-        blatantAutoEnabled = Value
-    end,
-})
-
-TargetTab:CreateInput({
-    Name = "Missiles per Blatant Salvo (Max 250)",
-    PlaceholderText = "250",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local val = tonumber(Text)
-        if val and val > 0 then blatantSalvoSize = math.clamp(val, 1, 250) end
-    end,
-})
-
-TargetTab:CreateInput({
-    Name = "Blatant Cooldown (seconds, 0 = none)",
-    PlaceholderText = "0.5",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local val = tonumber(Text)
-        if val and val >= 0 then blatantCooldown = val end
-    end,
-})
-
-TargetTab:CreateInput({
-    Name = "Custom Fire Count (for ⚡ FIRE button)",
-    PlaceholderText = "50",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local val = tonumber(Text)
-        if val and val > 0 then customFireCount = math.clamp(val, 1, 250) end
-    end,
-})
-
-TargetTab:CreateButton({
-    Name = "⚡ FIRE (Custom Count)",
-    Callback = function()
-        if not activeTargetPlayer then
-            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
-            return
-        end
-        local ready = getReadyMissiles()
-        if #ready == 0 then
-            Rayfield:Notify({ Title = "Error", Content = "No launchers ready!", Duration = 2.5 })
-            return
-        end
-        local toFire = math.min(customFireCount, #ready)
-        local objects = getActiveTargetObjects(activeTargetPlayer)
-        if #objects == 0 then
-            Rayfield:Notify({ Title = "No Fire", Content = "No targets found.", Duration = 2.5 })
-            return
-        end
-        local fired = 0
-        for i = 1, toFire do
-            local mInfo = ready[i]
-            local target = objects[(fired % #objects) + 1]
-            firedCache[mInfo.instance] = true
-            task.delay(3.5, function() firedCache[mInfo.instance] = nil end)
-            if target.instance then
-                local dmg = missileDamage[mInfo.name] or 500
-                dispatchedDamage[target.instance] = (dispatchedDamage[target.instance] or 0) + dmg
-                task.delay(4.0, function()
-                    if dispatchedDamage[target.instance] then
-                        dispatchedDamage[target.instance] = dispatchedDamage[target.instance] - dmg
-                        if dispatchedDamage[target.instance] <= 0 then dispatchedDamage[target.instance] = nil end
-                    end
-                end)
-            end
-            pcall(function() LaunchMissileEvent:FireServer(mInfo.instance, target.instance:GetPivot().Position) end)
-            fired = fired + 1
-        end
-        sessionStats.missilesFired = sessionStats.missilesFired + fired
-        Rayfield:Notify({ Title = "Custom Fire", Content = "Fired " .. fired .. " missiles!", Duration = 3 })
-    end,
-})
-
-TargetTab:CreateButton({
-    Name = "🔥 FIRE ALL",
-    Callback = function()
-        if not activeTargetPlayer then
-            Rayfield:Notify({ Title = "Error", Content = "Choose a target player first!", Duration = 2.5 })
-            return
-        end
-        local fired = fireAllRapid(activeTargetPlayer)
-        if fired > 0 then
-            Rayfield:Notify({ Title = "Blatant Fire", Content = "Fired " .. fired .. " missiles at once!", Duration = 3 })
-        else
-            Rayfield:Notify({ Title = "No Fire", Content = "No ready launchers or targets found.", Duration = 2.5 })
-        end
-    end,
-})
-
-
--- ──────────────────────────────────────────────────────────
--- 2. Bases Priority Sorting Tab Elements
--- ──────────────────────────────────────────────────────────
-PriorityTab:CreateSection("Bases Priority Settings")
-
-PriorityTab:CreateParagraph({
-    Title = "About Prioritization List",
-    Content = "This priority list is ONLY used when 'Target Selection Mode' is set to 'Bases Mode (Priority Queue)'.\n\nIt searches and locks onto base components in the order specified below. Separate entries with commas."
-})
-
-priorityInputUI = PriorityTab:CreateInput({
-    Name = "Edit Priority Queue",
-    PlaceholderText = "PlacedTurrets, PlacedBuildings, PlacedShields",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        updatePriorityList(Text)
-    end,
-})
-
--- ──────────────────────────────────────────────────────────
--- 3. Weapon Checklist Tab Elements
--- ──────────────────────────────────────────────────────────
-WeaponTab:CreateSection("Weapon Checklist")
-
-local sortedMissiles = {}
-for name, data in pairs(MissileData) do
-    if not cannonSet[name] then
-        table.insert(sortedMissiles, name)
-    end
-end
-table.sort(sortedMissiles)
-
--- Default all select in selectedMissileTypes
-for _, name in ipairs(sortedMissiles) do
-    selectedMissileTypes[name] = true
-end
-
-weaponDropdownUI = WeaponTab:CreateDropdown({
-    Name = "Select Launcher Types to Fire",
-    Options = sortedMissiles,
-    CurrentOption = sortedMissiles, -- Select all by default
-    MultipleOptions = true,
-    Flag = "weaponChecklist",
-    Callback = function(Options)
-        if not Options then return end
-        local newSelected = {}
-        for k, v in pairs(Options) do
-            if type(k) == "number" and type(v) == "string" then
-                newSelected[v] = true
-            elseif type(k) == "string" and v == true then
-                newSelected[k] = true
-            end
-        end
-        selectedMissileTypes = newSelected
-    end,
-})
-
-WeaponTab:CreateSection("Fire Mode")
-
-WeaponTab:CreateToggle({
-    Name = "🎯 Efficient Mode — Smart salvo sizing",
-    CurrentValue = false,
-    Callback = function(Value)
-        efficientModeEnabled = Value
-    end,
-})
-
-WeaponTab:CreateToggle({
-    Name = "⚖️ Balanced Fire — Interleave missile types",
-    CurrentValue = false,
-    Callback = function(Value)
-        balancedFireEnabled = Value
-    end,
-})
-
--- ──────────────────────────────────────────────────────────
--- 4. Auto Buy Tab Elements
--- ──────────────────────────────────────────────────────────
-BuyTab:CreateSection("Auto-Buy Activation")
-
-autoBuyToggleUI = BuyTab:CreateToggle({
-    Name = "💰 Enable Auto-Buy",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoBuyEnabled = Value
-    end,
-})
-
-BuyTab:CreateSection("Configure Auto-Buy Items")
-
-autoBuyMissilesDropdownUI = BuyTab:CreateDropdown({
-    Name = "Auto-Buy Missiles",
-    Options = orderedMissiles,
-    CurrentOption = {},
-    MultipleOptions = true,
-    Flag = "autoBuyMissiles",
-    Callback = function(Options)
-        if not Options then return end
-        local newSelected = {}
-        for k, v in pairs(Options) do
-            if type(k) == "number" and type(v) == "string" then
-                newSelected[v] = true
-            elseif type(k) == "string" and v == true then
-                newSelected[k] = true
-            end
-        end
-        autoBuySelectedMissiles = newSelected
-    end,
-})
-
-autoBuyBuildingsDropdownUI = BuyTab:CreateDropdown({
-    Name = "Auto-Buy Buildings",
-    Options = orderedBuildings,
-    CurrentOption = {},
-    MultipleOptions = true,
-    Flag = "autoBuyBuildings",
-    Callback = function(Options)
-        if not Options then return end
-        local newSelected = {}
-        for k, v in pairs(Options) do
-            if type(k) == "number" and type(v) == "string" then
-                newSelected[v] = true
-            elseif type(k) == "string" and v == true then
-                newSelected[k] = true
-            end
-        end
-        autoBuySelectedBuildings = newSelected
-    end,
-})
-
-autoBuyDefensesDropdownUI = BuyTab:CreateDropdown({
-    Name = "Auto-Buy Defenses",
-    Options = orderedDefenses,
-    CurrentOption = {},
-    MultipleOptions = true,
-    Flag = "autoBuyDefenses",
-    Callback = function(Options)
-        if not Options then return end
-        local newSelected = {}
-        for k, v in pairs(Options) do
-            if type(k) == "number" and type(v) == "string" then
-                newSelected[v] = true
-            elseif type(k) == "string" and v == true then
-                newSelected[k] = true
-            end
-        end
-        autoBuySelectedDefenses = newSelected
-    end,
-})
-
--- ──────────────────────────────────────────────────────────
--- 5. Defense Tab Elements
--- ──────────────────────────────────────────────────────────
-
-DefenseTab:CreateSection("Defense Mode")
-DefenseTab:CreateToggle({
-    Name = "🛡️ Defense Mode — Detect incoming attacks",
-    CurrentValue = false,
-    Callback = function(Value)
-        defenseModeEnabled = Value
-        if not Value then underAttackUntil = 0 end
-    end,
-})
-DefenseTab:CreateDropdown({
-    Name = "Shields to Use for Defense",
-    Options = {"Small Shield", "Good Shield", "Big Shield", "Hellstone Shield"},
-    CurrentOption = {"Small Shield", "Good Shield", "Big Shield", "Hellstone Shield"},
-    MultipleOptions = true,
-    Callback = function(Options)
-        local sel = {}
-        for _, name in ipairs(Options) do sel[name] = true end
-        defenseShieldTypes = sel
-    end,
-})
-
-DefenseTab:CreateSection("Auto-Repair")
-
-autoRepairToggleUI = DefenseTab:CreateToggle({
-    Name = "🔧 Enable Auto-Repair",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoRepairEnabled = Value
-    end,
-})
-
-DefenseTab:CreateSection("Missile Threshold Alert")
-
-DefenseTab:CreateToggle({
-    Name = "⚠️ Alert when Missile Count Drops Below Threshold",
-    CurrentValue = false,
-    Callback = function(Value)
-        missileAlertEnabled = Value
-    end,
-})
-
-DefenseTab:CreateInput({
-    Name = "Missile Alert Threshold",
-    PlaceholderText = "10",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local val = tonumber(Text)
-        if val and val > 0 then missileAlertThreshold = val end
-    end,
-})
-
--- ──────────────────────────────────────────────────────────
--- 6. Miscellaneous Tab Elements
--- ──────────────────────────────────────────────────────────
-
-MiscTab:CreateSection("Overlook Enemy Base")
-
--- Forward declarations for camera tracking (defined after UI setup)
-local cameraRenderSteppedConn = nil
-local startCameraTracking = function() end
-local stopCameraTracking = function() end
-
-cameraTrackingToggleUI = MiscTab:CreateToggle({
-    Name = "📷 Overlook Enemy Base",
-    CurrentValue = false,
-    Callback = function(Value)
-        trackingEnabled = Value
-        if Value then
-            startCameraTracking()
-            local camera = workspace.CurrentCamera
-            if camera then
-                camera.CameraType = Enum.CameraType.Scriptable
-                -- Determine target position (enemy base or current look-at)
-                local lookTarget
-                if activeTargetPlayer then
-                    local eb = getBaseByPlayerName(activeTargetPlayer)
-                    if eb then
-                        lookTarget = eb:GetPivot().Position
-                        local myPos = getMyBase() and getMyBase():GetPivot().Position or camera.CFrame.Position
-                        local dir = (lookTarget - myPos).Unit
-                        targetYaw = math.deg(math.atan2(dir.X, dir.Z))
-                        targetPitch = 35
-                    end
-                end
-                if not lookTarget then
-                    lookTarget = camera.CFrame.Position + camera.CFrame.LookVector * 80
-                    targetYaw, targetPitch = 45, 35
-                end
-                cameraTargetPos = lookTarget
-                targetPos = lookTarget
-                targetDist = 120
-
-                -- Start from current camera position for smooth transition
-                local currentOffset = camera.CFrame.Position - lookTarget
-                cameraDistance = math.clamp(currentOffset.Magnitude, 40, 350)
-                cameraYaw = math.deg(math.atan2(currentOffset.X, currentOffset.Z))
-                cameraPitch = math.deg(math.asin(math.clamp(currentOffset.Y / cameraDistance, -1, 1)))
-                activeTrackingEnd = 9e9
-            end
-        else
-            stopCameraTracking()
-            pcall(function()
-                local camera = workspace.CurrentCamera
-                if camera and camera.CameraType == Enum.CameraType.Scriptable then
-                    camera.CameraType = Enum.CameraType.Custom
-                    local char = LocalPlayer.Character
-                    local hum = char and char:FindFirstChildOfClass("Humanoid")
-                    if hum then camera.CameraSubject = hum end
-                end
-            end)
-            activeTrackingEnd = 0
-        end
-    end,
-})
-
-
-
-local hpBars = {} -- [building] = BillboardGui
-
-MiscTab:CreateToggle({
-    Name = "💚 Enemy HP Bars (Free Cam Overlay)",
-    CurrentValue = false,
-    Callback = function(Value)
-        hpOverlayEnabled = Value
-        if not Value then
-            for _, bg in pairs(hpBars) do pcall(function() bg:Destroy() end) end
-            hpBars = {}
-        end
-    end,
-})
-
-
-MiscTab:CreateSection("Black Market Actions")
-
-autoSpinBlackMarketToggleUI = MiscTab:CreateToggle({
-    Name = "🎰 Auto-Spin Black Market (Gems)",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoSpinBlackMarket = Value
-    end,
-})
-MiscTab:CreateToggle({
-    Name = "🍀 Auto-Spin Lucky Spins",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoSpinLucky = Value
-    end,
-})
-
-MiscTab:CreateSection("Rewards & Quests Auto-Claim")
-
-autoClaimRewardsToggleUI = MiscTab:CreateToggle({
-    Name = "🎁 Auto-Claim Quests & Rewards",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoClaimRewards = Value
-    end,
-})
-
-MiscTab:CreateToggle({
-    Name = "🏰 Auto-Claim Clan Mission Rewards",
-    CurrentValue = false,
-    Callback = function(Value)
-        autoClanClaimEnabled = Value
-    end,
-})
-
-MiscTab:CreateSection("Session Stats")
-
-local statsParagraph = MiscTab:CreateParagraph({
-    Title = "SESSION STATS",
-    Content = "Missiles Fired: 0\nDamage Dealt: 0\nBuildings Destroyed: 0\nBases Wiped: 0\nELO Gained: 0"
-})
-
-
-MiscTab:CreateSection("📐 Base Template System")
-
-MiscTab:CreateParagraph({
+BuildingTab:CreateParagraph({
     Title = "Template Info",
     Content = "Save your entire base layout (buildings, turrets, shields, missiles) to a file. Load it back to rebuild exactly. Uses the hammer tool to clear first."
 })
 
-local templateDropdown = MiscTab:CreateDropdown({
+local templateDropdown = BuildingTab:CreateDropdown({
     Name = "Select Saved Template",
     Options = getTemplateList(),
     CurrentOption = "",
@@ -2316,14 +2041,14 @@ local templateDropdown = MiscTab:CreateDropdown({
     end,
 })
 
-MiscTab:CreateButton({
+BuildingTab:CreateButton({
     Name = "🔄 Refresh Templates",
     Callback = function()
         templateDropdown:Refresh(getTemplateList())
     end,
 })
 
-MiscTab:CreateInput({
+BuildingTab:CreateInput({
     Name = "Template Name",
     PlaceholderText = "mybase",
     RemoveTextAfterFocusLost = false,
@@ -2332,7 +2057,7 @@ MiscTab:CreateInput({
     end,
 })
 
-MiscTab:CreateButton({
+BuildingTab:CreateButton({
     Name = "💾 Save Current Layout",
     Callback = function()
         local base = getMyBase()
@@ -2386,7 +2111,7 @@ MiscTab:CreateButton({
     end,
 })
 
-MiscTab:CreateButton({
+BuildingTab:CreateButton({
     Name = "📂 Load & Rebuild Layout",
     Callback = function()
         local selectedName = currentTemplateSelection
@@ -2523,15 +2248,449 @@ MiscTab:CreateButton({
 })
 
 
-MiscTab:CreateSection("Tycoon Placement Actions")
+-- Main Tab — Auto-Build & Placement
 
+-- Precompute Weapon Geometry: floor offset + directional horizontal footprints
+-- After -90deg Z rotation: local-Y becomes world-X, local-Z stays world-Z
+-- Load weapon geometry from hosted JSON (fast, avoids cloning 31 models)
+local weaponGeometry = {}
+local weaponGeometryLoaded = false
+pcall(function()
+    local raw = game:HttpGet("https://raw.githubusercontent.com/picksov/Roblox/refs/heads/main/weapon-geometry.json")
+    local data = game:GetService("HttpService"):JSONDecode(raw)
+    if data then
+        for name, geom in pairs(data) do
+            weaponGeometry[name] = {
+                u45 = geom.u45,
+                stepX = geom.stepX,
+                stepZ = geom.stepZ,
+                size = Vector3.new(geom.sizeX, geom.sizeY, geom.sizeZ)
+            }
+        end
+        weaponGeometryLoaded = true
+    end
+end)
 
-MiscTab:CreateParagraph({
+-- Fallback: compute locally if fetch fails (kept for offline / executor compatibility)
+local function precomputeWeaponGeometry()
+    for name, data in pairs(MissileData) do
+    if type(data) == "table" then
+        local folder = ReplicatedStorage.Assets:FindFirstChild("Missiles")
+        local m = folder and folder:FindFirstChild(name)
+        if not m and ReplicatedStorage.Assets:FindFirstChild("Cannons") then
+            m = ReplicatedStorage.Assets.Cannons:FindFirstChild(name)
+        end
+        if m then
+            local clone = m:Clone()
+            local u42 = data.IsCannon and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
+            clone:PivotTo(clone:GetPivot() * u42)
+            local Y = clone:GetPivot().Y
+            local bboxCF, bboxSize = clone:GetBoundingBox()
+            local u45 = Y - (bboxCF.Y - bboxSize.Y / 2)
+            local stepX = bboxSize.Y + 0.2
+            local stepZ = bboxSize.Z + 0.2
+            weaponGeometry[name] = { u45 = u45, stepX = stepX, stepZ = stepZ, size = bboxSize }
+            clone:Destroy()
+        else
+            weaponGeometry[name] = { u45 = 2, stepX = 3.2, stepZ = 3.2, size = Vector3.new(4, 8, 4) }
+    end
+        end
+    end
+end
+if not weaponGeometryLoaded then precomputeWeaponGeometry() end
+
+-- Fast collision check — scans only our own base's placed items
+canPlaceAt = function(cf, size, base)
+    cleanPendingCache()
+    -- Check local pending cache first (catches recently-fired placements before server sync)
+    if isPendingBlocked(cf, size) then return false end
+    local pos = cf.Position
+    local halfWorldX = size.Y / 2 + 1.0
+    local halfWorldZ = size.Z / 2 + 1.0
+    local folders = {"PlacedMissiles", "PlacedBuildings", "PlacedTurrets", "PlacedShields"}
+    for _, folderName in ipairs(folders) do
+        local folder = base:FindFirstChild(folderName)
+        if folder then
+            for _, item in ipairs(folder:GetChildren()) do
+                local itemPos = nil
+                if item:IsA("Model") then itemPos = item:GetPivot().Position
+                elseif item:IsA("BasePart") then itemPos = item.Position end
+                if itemPos then
+                    local dx = math.abs(pos.X - itemPos.X)
+                    local dz = math.abs(pos.Z - itemPos.Z)
+                    if dx < halfWorldX and dz < halfWorldZ then return false end
+                end
+            end
+        end
+    end
+    return true
+end
+
+-- Wrapper: records the position in the pending cache, then fires PlaceMissile.
+-- This lets canPlaceAt see our own pending placements before the server syncs.
+local function firePlaceMissile(name, worldCF)
+    recordPending(worldCF)
+    pcall(function() ReplicatedStorage.Events.PlaceMissile:FireServer(name, worldCF) end)
+end
+
+-- ── Fast auto-build helpers ──
+-- Builds a coordinate lookup table of all placed items (once per build pass)
+-- instead of calling GetChildren() on 4 folders for every grid cell.
+local function buildPlacedLookup(base)
+    local lookup = {}
+    local folders = {"PlacedMissiles", "PlacedBuildings", "PlacedTurrets", "PlacedShields"}
+    for _, fn in ipairs(folders) do
+        local f = base:FindFirstChild(fn)
+        if f then
+            for _, item in ipairs(f:GetChildren()) do
+                local pos
+                if item:IsA("Model") then pos = item:GetPivot().Position
+                elseif item:IsA("BasePart") then pos = item.Position end
+                if pos then
+                    lookup[roundKey(pos.X) .. "," .. roundKey(pos.Z)] = true
+                end
+            end
+        end
+    end
+    return lookup
+end
+
+-- Fast version: uses pre-built lookup + pending cache, no GetChildren() per call.
+local function canPlaceAtFast(cf, size, placedLookup)
+    if not size then return true end
+    local pos = cf.Position
+    local halfX = size.Y / 2 + 1.0
+    local halfZ = size.Z / 2 + 1.0
+    local now = os.clock()
+    -- Center-first: fast reject if center cell is blocked (avoids full sweep)
+    local ckey = roundKey(pos.X) .. "," .. roundKey(pos.Z)
+    if placedLookup[ckey] then return false end
+    local ts = pendingPlacements[ckey]
+    if ts and now - ts < PENDING_TTL then return false end
+    -- Full sweep at 1.0 granularity (halves lookups vs 0.5)
+    for dx = -halfX, halfX, 1.0 do
+        for dz = -halfZ, halfZ, 1.0 do
+            local key = roundKey(pos.X + dx) .. "," .. roundKey(pos.Z + dz)
+            if placedLookup[key] then return false end
+            local ts2 = pendingPlacements[key]
+            if ts2 and now - ts2 < PENDING_TTL then return false end
+        end
+    end
+    return true
+end
+
+-- Instant verification hook — tracks placements (tool removed) and pickups (tool added)
+local placementCallbacks = {} -- [toolName] = {callback = fn, thread = co}
+local pickupCallbacks = {}   -- [toolName] = {callback = fn, thread = co}
+local function initPlacementHook()
+    local backpack = LocalPlayer.Backpack
+    local mt = getrawmetatable(backpack)
+    if not mt then return end
+    makewritable(mt)
+    local oldNewindex = rawget(mt, "__newindex") or function() end
+    rawset(mt, "__newindex", function(t, k, v)
+        if type(k) == "string" then
+            if v == nil then
+                -- Tool removed: placement consumed
+                local pending = placementCallbacks[k]
+                if pending then
+                    placementCallbacks[k] = nil
+                    if pending.callback then pending.callback() end
+                    if pending.thread then pcall(coroutine.resume, pending.thread) end
+                end
+            else
+                -- Tool added: pickup returned or purchase arrived
+                local pending = pickupCallbacks[k]
+                if pending then
+                    pickupCallbacks[k] = nil
+                    if pending.callback then pending.callback() end
+                    if pending.thread then pcall(coroutine.resume, pending.thread) end
+                end
+            end
+        end
+        return oldNewindex(t, k, v)
+    end)
+end
+initPlacementHook()
+
+-- Auto-Build: speed = batch-fire, precision = per-placement verify, gap-fill + retry
+-- Optimized: placed-count is cached locally and refreshed every 20 placements
+-- to avoid allocating a new table via GetChildren() on every inner-loop iteration.
+local function runAutoBuild()
+    if isBuilding then return 0 end
+    isBuilding = true
+    local placedCount = 0
+    local success, err = pcall(function()
+        local base = getMyBase()
+        if not base then return end
+        local zone = base:FindFirstChild("PlacementZone")
+        if not zone then return end
+        local zoneCF = zone.CFrame
+        local zoneSize = zone.Size
+        local halfX = math.floor(zoneSize.X / 2)
+        local halfZ = math.floor(zoneSize.Z / 2)
+
+        local placedFolder = base:FindFirstChild("PlacedMissiles")
+        -- Cached placed count — refreshed every 20 placements to avoid GetChildren() per iteration
+        local cachedPlaced = placedFolder and #placedFolder:GetChildren() or 0
+        local placesSinceRefresh = 0
+        local function refreshPlaced()
+            cachedPlaced = placedFolder and #placedFolder:GetChildren() or cachedPlaced
+            placesSinceRefresh = 0
+        end
+        local function bumpPlaced()
+            cachedPlaced = cachedPlaced + 1
+            placesSinceRefresh = placesSinceRefresh + 1
+            if placesSinceRefresh >= 20 then refreshPlaced() end
+        end
+        -- Helper: wait for server (precision mode only)
+        local function syncPlaced(minExpected)
+            for _ = 1, 15 do
+                task.wait(0.05)
+                local now = placedFolder and #placedFolder:GetChildren() or 0
+                if now >= 250 or now >= minExpected then refreshPlaced(); return now end
+            end
+            refreshPlaced()
+            return cachedPlaced
+        end
+
+        -- 1. Count tools in Backpack + Character (once per type)
+        local toolCounts = {}
+        local orderedToBuild = {}
+        for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
+            if child:IsA("Tool") and autoBuildSelectedMissileTypes[child.Name] then
+                toolCounts[child.Name] = (toolCounts[child.Name] or 0) + 1
+            end
+        end
+        if LocalPlayer.Character then
+            for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
+                if child:IsA("Tool") and autoBuildSelectedMissileTypes[child.Name] then
+                    toolCounts[child.Name] = (toolCounts[child.Name] or 0) + 1
+                end
+            end
+        end
+
+        for name, count in pairs(toolCounts) do
+            local price = MissileData[name] and MissileData[name].Price or 0
+            table.insert(orderedToBuild, {name = name, count = count, price = price})
+        end
+        table.sort(orderedToBuild, function(a, b) return a.price < b.price end)
+
+        -- Build coordinate lookup once instead of 4x GetChildren() per grid cell
+        cleanPendingCache()
+        local placedLookup = buildPlacedLookup(base)
+
+        local fires = 0
+        local scanMargin = 4
+
+        -- ── Primary scan ──
+        local wIndex = 0
+        for _, info in ipairs(orderedToBuild) do
+            if not autoBuildMissilesToggleEnabled then break end
+            local name = info.name
+            local geom = weaponGeometry[name] or { u45 = 2, stepX = 3.2, stepZ = 3.2, size = Vector3.new(4, 8, 4) }
+            local isCannon = cannonSet[name]
+            local upRotation = isCannon and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
+            local invRemaining = info.count
+
+            local stepX = geom.stepX
+            local stepZ = geom.stepZ
+            for x = -halfX + scanMargin, halfX - scanMargin, stepX do
+                if not autoBuildMissilesToggleEnabled or invRemaining <= 0 then break end
+                if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                for z = -halfZ + scanMargin, halfZ - scanMargin, stepZ do
+                    if not autoBuildMissilesToggleEnabled or invRemaining <= 0 then break end
+                    if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+
+                    local localCF = CFrame.new(x, geom.u45, z) * upRotation
+                    local worldCF = zoneCF:ToWorldSpace(localCF)
+
+                    if precisionBuildEnabled then
+                        if canPlaceAt(worldCF, geom.size, base) then
+                            local before = cachedPlaced
+                            placementCallbacks[name] = { callback = function() end }
+                            firePlaceMissile(name, worldCF)
+                            
+                            -- Wait for backpack hook or timeout (0.4s max)
+                            for _ = 1, 20 do
+                                if not placementCallbacks[name] then break end
+                                task.wait(0.02)
+                            end
+                            placementCallbacks[name] = nil
+                            
+                            -- Sync count to confirm success
+                            local now = placedFolder and #placedFolder:GetChildren() or before
+                            if now > before then
+                                placedCount = placedCount + 1
+                                bumpPlaced()
+                            end
+                            invRemaining = invRemaining - 1
+                        end
+                    else
+                        -- Speed mode: fast bursts with real server count check
+                        if canPlaceAtFast(worldCF, geom.size, placedLookup) then
+                            firePlaceMissile(name, worldCF)
+                            local _p = worldCF.Position
+                            placedLookup[roundKey(_p.X) .. "," .. roundKey(_p.Z)] = true
+                            fires = fires + 1
+                            invRemaining = invRemaining - 1
+                            -- Check real server count every time — stops spam past 250
+                            if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                            task.wait(0.12) -- steady pace, 8/sec, zero rejections
+                        end
+                    end
+                end
+            end
+        end
+
+        if not precisionBuildEnabled then
+            -- Speed mode: wait for server, sync count, done (no gap-fill)
+            task.wait(0.2)
+            placedCount = placedFolder and #placedFolder:GetChildren() or fires
+        end
+
+        -- ── Gap-fill (precision mode only) ──
+        if precisionBuildEnabled then
+            refreshPlaced() -- sync from server before gap-fill
+        if autoBuildMissilesToggleEnabled and (placedFolder and #placedFolder:GetChildren() or 0) < 250 then
+            local remainingTools = {}
+            for _, info in ipairs(orderedToBuild) do
+                local n = 0
+                for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
+                    if child.Name == info.name then n = n + 1 end
+                end
+                if LocalPlayer.Character then
+                    for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
+                        if child.Name == info.name then n = n + 1 end
+                    end
+                end
+                if n > 0 then table.insert(remainingTools, {name = info.name, price = info.price, inv = n}) end
+            end
+            table.sort(remainingTools, function(a, b) return a.price < b.price end)
+
+            local gapFires = 0
+            for _, rt in ipairs(remainingTools) do
+                if not autoBuildMissilesToggleEnabled then break end
+                if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                local geom = weaponGeometry[rt.name] or { u45 = 2, size = Vector3.new(4, 8, 4) }
+                local upRotation = cannonSet[rt.name] and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
+                local invLeft = rt.inv
+
+                for x = -halfX, halfX, 1.8 do
+                    if not autoBuildMissilesToggleEnabled then break end
+                    if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                    if invLeft <= 0 then break end
+                    for z = -halfZ, halfZ, 1.8 do
+                        if not autoBuildMissilesToggleEnabled then break end
+                        if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                        if invLeft <= 0 then break end
+
+                        local localCF = CFrame.new(x, geom.u45, z) * upRotation
+                        local worldCF = zoneCF:ToWorldSpace(localCF)
+                        if precisionBuildEnabled then
+                            local before = cachedPlaced
+                            placementCallbacks[rt.name] = { callback = function() end }
+                            firePlaceMissile(rt.name, worldCF)
+                            
+                            -- Wait for backpack hook or timeout (0.4s max)
+                            for _ = 1, 20 do
+                                if not placementCallbacks[rt.name] then break end
+                                task.wait(0.02)
+                            end
+                            placementCallbacks[rt.name] = nil
+                            
+                            -- Sync count to confirm success
+                            local now = placedFolder and #placedFolder:GetChildren() or before
+                            if now > before then
+                                placedCount = placedCount + 1
+                                bumpPlaced()
+                            end
+                        else
+                            if canPlaceAtFast(worldCF, geom.size, placedLookup) then
+                                firePlaceMissile(rt.name, worldCF)
+                                local _p = worldCF.Position
+                                placedLookup[roundKey(_p.X) .. "," .. roundKey(_p.Z)] = true
+                                gapFires = gapFires + 1
+                                placedCount = placedCount + 1
+                                -- Check real server count — stop past 250
+                                if placedFolder and #placedFolder:GetChildren() >= 250 then break end
+                                task.wait(0.12) -- steady pace
+                            end
+                        end
+                        invLeft = invLeft - 1
+                    end
+                end
+            end
+
+            -- ── Precision retry: 1.0-stud sweep for remaining spots ──
+            refreshPlaced()
+            if precisionBuildEnabled and cachedPlaced < 250 then
+                local retryTools = {}
+                for _, info in ipairs(orderedToBuild) do
+                    local n = 0
+                    for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
+                        if child.Name == info.name then n = n + 1 end
+                    end
+                    if LocalPlayer.Character then
+                        for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
+                            if child.Name == info.name then n = n + 1 end
+                        end
+                    end
+                    if n > 0 then table.insert(retryTools, {name = info.name, price = info.price}) end
+                end
+                table.sort(retryTools, function(a, b) return a.price < b.price end)
+
+                for _, rt in ipairs(retryTools) do
+                    if not autoBuildMissilesToggleEnabled then break end
+                    if cachedPlaced >= 250 then break end
+                    local geom = weaponGeometry[rt.name] or { u45 = 2, size = Vector3.new(4, 8, 4) }
+                    local upRotation = cannonSet[rt.name] and CFrame.identity or CFrame.Angles(0, 0, -1.5707963267948966)
+
+                    for x = -halfX, halfX, 1.0 do
+                        if not autoBuildMissilesToggleEnabled then break end
+                        if cachedPlaced >= 250 then break end
+                        for z = -halfZ, halfZ, 1.0 do
+                            if not autoBuildMissilesToggleEnabled then break end
+                            if cachedPlaced >= 250 then break end
+
+                            local localCF = CFrame.new(x, geom.u45, z) * upRotation
+                            local worldCF = zoneCF:ToWorldSpace(localCF)
+                            local before = cachedPlaced
+                            placementCallbacks[rt.name] = { callback = function() end }
+                            firePlaceMissile(rt.name, worldCF)
+                            
+                            -- Wait for backpack hook or timeout (0.4s max)
+                            for _ = 1, 20 do
+                                if not placementCallbacks[rt.name] then break end
+                                task.wait(0.02)
+                            end
+                            placementCallbacks[rt.name] = nil
+                            
+                            -- Sync count to confirm success
+                            local now = placedFolder and #placedFolder:GetChildren() or before
+                            if now > before then
+                                placedCount = placedCount + 1
+                                bumpPlaced()
+                            end
+                            if cachedPlaced >= 250 then break end
+                        end
+                    end
+                end
+            end
+        end
+        end -- precisionBuildEnabled gap-fill wrapper
+    end)
+    isBuilding = false
+    if not success then warn("[Auto-Build Error]: " .. tostring(err)) end
+    return placedCount
+end
+
+MainTab:CreateParagraph({
     Title = "Placement Mode",
     Content = "SPEED (off): Fire-and-forget — places missiles as fast as possible with batch verification. Runs smoothly alongside auto-fire. May leave 1-3 spots unfilled due to server timing.\n\nPRECISION (on): Verifies every placement individually with retries. Fills every possible spot but is significantly slower. Use for setup, not combat."
 })
 
-MiscTab:CreateToggle({
+MainTab:CreateToggle({
     Name = "🎯 Precision Placement Mode",
     CurrentValue = false,
     Callback = function(Value)
@@ -2539,7 +2698,7 @@ MiscTab:CreateToggle({
     end,
 })
 
-autoBuildToggleUI = MiscTab:CreateToggle({
+autoBuildToggleUI = MainTab:CreateToggle({
     Name = "🏗️ Enable Auto-Build Missiles",
     CurrentValue = false,
     Flag = "autoBuildToggle",
@@ -2551,7 +2710,7 @@ autoBuildToggleUI = MiscTab:CreateToggle({
     end,
 })
 
-autoBuildMissilesDropdownUI = MiscTab:CreateDropdown({
+autoBuildMissilesDropdownUI = MainTab:CreateDropdown({
     Name = "Select Missiles to Auto-Build",
     Options = sortedMissiles, -- only missiles (no cannons, buildings, defenses)
     CurrentOption = {},
@@ -2572,7 +2731,7 @@ autoBuildMissilesDropdownUI = MiscTab:CreateDropdown({
 })
 
 -- Clear placed MISSILE launchers only (not cannons, buildings, or defenses)
-MiscTab:CreateButton({
+MainTab:CreateButton({
     Name = "🗑️ Clear All Placed Missile Launchers",
     Callback = function()
         local base = getMyBase()
@@ -2646,9 +2805,9 @@ MiscTab:CreateButton({
     end,
 })
 
--- ──────────────────────────────────────────────────────────
--- 7. Settings Tab Elements
--- ──────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════
+-- SETTINGS TAB — Profiles & Config
+-- ══════════════════════════════════════════════════════════
 SettingsTab:CreateSection("Profiles Preset Manager")
 
 local function getProfileList()
@@ -2771,6 +2930,7 @@ local function loadProfile(profileName)
         if priorityInputUI then pcall(function() priorityInputUI:Set(priorityString) end) end
         if autoBuildToggleUI then pcall(function() autoBuildToggleUI:Set(autoBuildMissilesToggleEnabled) end) end
         if autoBuildMissilesDropdownUI then pcall(function() autoBuildMissilesDropdownUI:Set(getKeysFromMap(autoBuildSelectedMissileTypes)) end) end
+        if afkToggleUI then pcall(function() afkToggleUI:Set(afkModeEnabled) end) end
 
         Rayfield:Notify({ Title = "Success", Content = "Loaded profile: " .. profileName, Duration = 3 })
     end)
@@ -2896,35 +3056,6 @@ SettingsTab:CreateButton({
     end,
 })
 
-SettingsTab:CreateSection("Community")
-
-SettingsTab:CreateButton({
-    Name = "💬 Copy Discord Invite",
-    Callback = function()
-        local invite = "discord.gg/"
-        local success, code = pcall(function()
-            return game:HttpGet("https://raw.githubusercontent.com/picksov/Roblox/refs/heads/main/Discord")
-        end)
-        if success and code then
-            invite = invite .. code:gsub("%s+", "")
-            if setclipboard then
-                setclipboard(invite)
-                Rayfield:Notify({
-                    Title = "Copied!",
-                    Content = invite,
-                    Duration = 4
-                })
-            end
-        else
-            Rayfield:Notify({
-                Title = "Error",
-                Content = "Failed to load invite: " .. tostring(code),
-                Duration = 5
-            })
-        end
-    end,
-})
-
 SettingsTab:CreateSection("AFK Mode")
 
 SettingsTab:CreateParagraph({
@@ -2968,6 +3099,35 @@ SettingsTab:CreateInput({
     end,
 })
 
+SettingsTab:CreateSection("Community")
+
+SettingsTab:CreateButton({
+    Name = "💬 Copy Discord Invite",
+    Callback = function()
+        local invite = "discord.gg/"
+        local success, code = pcall(function()
+            return game:HttpGet("https://raw.githubusercontent.com/picksov/Roblox/refs/heads/main/Discord")
+        end)
+        if success and code then
+            invite = invite .. code:gsub("%s+", "")
+            if setclipboard then
+                setclipboard(invite)
+                Rayfield:Notify({
+                    Title = "Copied!",
+                    Content = invite,
+                    Duration = 4
+                })
+            end
+        else
+            Rayfield:Notify({
+                Title = "Error",
+                Content = "Failed to load invite: " .. tostring(code),
+                Duration = 5
+            })
+        end
+    end,
+})
+
 -- (Background economy helpers moved to GAMEPLAY HELPERS section)
 
 local currentActiveObject = nil
@@ -2986,7 +3146,7 @@ task.spawn(function()
 
     while true do
         task.wait(0.3)
-        local ok, isVis = pcall(function() return Rayfield:IsVisible() end); if not ok or not isVis then
+        if not pcall(function() return Rayfield:IsVisible() end) then
             task.wait(2.0)
         else
             local firingState = "IDLE"
@@ -3280,14 +3440,14 @@ task.spawn(function()
                     if autoCycleEnabled and isAutoFiring and #targetObjects == 0 then
                         -- Build prioritized player list for server dominance
                         local playerList = refreshPlayerList()
-                        if targetPriorityMode == "Richest" then
+                        if targetPriorityMode == "Richest First" then
                             table.sort(playerList, function(a, b)
                                 local pA, pB = Players:FindFirstChild(a), Players:FindFirstChild(b)
                                 local cashA = pA and pA:FindFirstChild("leaderstats") and pA.leaderstats:FindFirstChild("Cash") and pA.leaderstats.Cash.Value or 0
                                 local cashB = pB and pB:FindFirstChild("leaderstats") and pB.leaderstats:FindFirstChild("Cash") and pB.leaderstats.Cash.Value or 0
                                 return cashA > cashB
                             end)
-                        elseif targetPriorityMode == "Weakest" then
+                        elseif targetPriorityMode == "Weakest First" then
                             table.sort(playerList, function(a, b)
                                 local objA, objB = getActiveTargetObjects(a), getActiveTargetObjects(b)
                                 local hpA, hpB = 0, 0
@@ -3295,7 +3455,7 @@ task.spawn(function()
                                 for _, o in ipairs(objB) do hpB = hpB + (o.hp or 0) end
                                 return hpA < hpB
                             end)
-                        elseif targetPriorityMode == "Custom" and #targetPriorityList > 0 then
+                        elseif targetPriorityMode == "Custom Order" and #targetPriorityList > 0 then
                             local ordered = {}
                             local seen = {}
                             for _, name in ipairs(targetPriorityList) do
@@ -3691,8 +3851,6 @@ end)
 -- ──────────────────────────────────────────────────────────
 local UIS = game:GetService("UserInputService")
 local mouseDeltaX, mouseDeltaY = 0, 0
-local targetYaw, targetPitch, targetDist = 45, 40, 120
-local targetPos = Vector3.zero
 
 pcall(function()
     UIS.InputBegan:Connect(function(input, processed)
